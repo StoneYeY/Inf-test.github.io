@@ -1,0 +1,177 @@
+// Monkey patch for WebGPU API before importing web-llm
+if (navigator.gpu) {
+  const originalRequestAdapter = navigator.gpu.requestAdapter;
+  navigator.gpu.requestAdapter = async function(...args) {
+    const adapter = await originalRequestAdapter.apply(this, args);
+    if (adapter && !adapter.requestAdapterInfo) {
+      // Add missing requestAdapterInfo method
+      adapter.requestAdapterInfo = async function() {
+        return { 
+          vendor: "unknown", 
+          architecture: "unknown", 
+          device: "unknown", 
+          description: "Completed" 
+        };
+      };
+    }
+    return adapter;
+  };
+}
+
+
+// Serve the chat workload through web worker
+import {
+  ChatWorkerHandler,
+  ChatModule,
+  LogitProcessor,
+  WorkerMessage,
+  CustomRequestParams,
+  ChatInterface,
+  GenerationConfig,
+} from "@mlc-ai/web-llm";
+import { MusicLogitProcessor } from "./music_logit_processor";
+import {
+  ChunkGenerator,
+  GenerationProgressCallback,
+} from "./music_transformer_generate";
+
+const musicLogitProcessor = new MusicLogitProcessor();
+const logitProcessorRegistry = new Map<string, LogitProcessor>();
+
+logitProcessorRegistry.set("music-small-800k-q0f32", musicLogitProcessor);
+logitProcessorRegistry.set("music-medium-800k-q0f32", musicLogitProcessor);
+
+class CustomChatWorkerHandler extends ChatWorkerHandler {
+  private chunkGenerator: ChunkGenerator;
+  private chunkIterator: AsyncGenerator<Array<number>, void, void>;
+  private callback: GenerationProgressCallback;
+
+  constructor(chat: ChatInterface) {
+    super(chat);
+    this.callback = (generated, total) => {
+      const msg: WorkerMessage = {
+        kind: "customRequest",
+        uuid: "",
+        content: {
+          requestName: "generationRequestCallback",
+          requestMessage: `Generated ${generated}/${total} tokens`,
+        },
+      };
+      postMessage(msg);
+    };
+    this.chunkGenerator = new ChunkGenerator();
+    this.chunkIterator = this.chunkGenerator.chunkGenerate(
+      chat,
+      musicLogitProcessor,
+      this.callback
+    );
+  }
+
+  onmessage(event: MessageEvent<any>): void {
+    const msg = event.data as WorkerMessage;
+    switch (msg.kind) {
+      case "customRequest": {
+        const params = msg.content as CustomRequestParams;
+        if (params.requestName == "chunkGenerate") {
+          // 添加检查，确保有有效的请求信息
+          let genConfig: GenerationConfig;
+          
+          if (!params.requestMessage || params.requestMessage === "undefined") { //simple solution to solve undefined by now
+            console.log("Worker: received invalid config, using defaults");
+            // 使用默认配置
+            genConfig = {
+              temperature: 1.0,
+              top_p: 0.98,
+              frequency_penalty: 0.0
+            };
+          } else {
+            try {
+              genConfig = JSON.parse(params.requestMessage) as GenerationConfig;
+            } catch (error) {
+              console.error("Worker: error parsing config, using defaults", error);
+              // 解析错误时也使用默认配置
+              genConfig = {
+                temperature: 1.0,
+                top_p: 0.98,
+                frequency_penalty: 0.0
+              };
+            }
+          }
+          
+          this.chunkGenerator.setGenConfig(genConfig);
+          console.log(
+            "Worker: generating music-transformer tokens with config",
+            genConfig
+          );
+          this.handleTask(msg.uuid, async () => {
+            const { value } = await this.chunkIterator.next();
+            console.log("Worker: done generating");
+            return value!.join();
+          });
+        } else if (params.requestName == "resetGenerator") {
+          console.log("Worker: reset music-transformer generator");
+          this.handleTask(msg.uuid, async () => {
+            this.chunkGenerator.interrupt();
+            let promptTokens;
+            if (params.requestMessage.length > 0) {
+              promptTokens = params.requestMessage
+                .split(",")
+                .map((str) => parseInt(str));
+            } else {
+              promptTokens = [];
+            }
+
+            this.chunkGenerator = new ChunkGenerator();
+            this.chunkIterator = this.chunkGenerator.chunkGenerate(
+              chat,
+              musicLogitProcessor,
+              this.callback,
+              promptTokens
+            );
+            musicLogitProcessor.resetState();
+            chat.resetChat();
+            return null;
+          });
+        } else if (params.requestName == "interrupt") {
+          console.log("Worker: pausing music-transformer generator");
+          this.handleTask(msg.uuid, async () => {
+            this.chunkGenerator.setPause();
+            return null;
+          });
+        } else if (params.requestName == "restart") {
+          console.log("Worker: restarting music-transformer generator");
+          this.handleTask(msg.uuid, async () => {
+            this.chunkGenerator.setPause(false);
+            return null;
+          });
+        } else if (params.requestName == "selectInstrument") {
+          console.log("Worker: selected instrument", params.requestMessage);
+          this.handleTask(msg.uuid, async () => {
+            if (params.requestMessage.length > 0) {
+              musicLogitProcessor.setInstrumentSet(
+                params.requestMessage.split(",").map((str) => parseInt(str))
+              );
+            } else {
+              musicLogitProcessor.setInstrumentSet([]);
+            }
+            return null;
+          });
+        } else if (params.requestName == "setEnsembleDensity") {
+          this.handleTask(msg.uuid, async () => {
+            musicLogitProcessor.setEnsembleDensity(parseFloat(params.requestMessage));
+            return null;
+          });
+        }
+        return;
+      }
+      default:
+        super.onmessage(event);
+    }
+  }
+}
+
+const chat = new ChatModule(logitProcessorRegistry);
+const handler = new CustomChatWorkerHandler(chat);
+self.onmessage = (msg: MessageEvent) => {
+  handler.onmessage(msg);
+};
